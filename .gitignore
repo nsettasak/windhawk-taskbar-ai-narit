@@ -1,0 +1,19 @@
+dist/
+*.dll
+*.exe
+*.whl
+keyinfo.json
+narit-key.txt
+install.log
+tests/generated/
+*.key
+*.pem
+secrets/
+
+# unslop-ui reads its per-project taste file from here; it travels with the skill, not the repo
+.unslop-ui/
+
+# Dev-only: the build, the reload and the NARIT parse fixtures stay on this machine, not in the
+# published mod. Windhawk compiles the single .wh.cpp by itself.
+scripts/
+tests/
