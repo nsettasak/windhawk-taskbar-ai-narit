@@ -12,6 +12,94 @@
 // @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lwindowsapp -lwinhttp -luser32 -lshell32 -lgdi32 -ladvapi32 -lws2_32 -liphlpapi -lcrypt32 -lbcrypt -lcomctl32 -lcomdlg32 -lxmllite -ld2d1 -ldwrite -ld3d11 -ldxgi -lwindowscodecs -ldwmapi -luxtheme
 // ==/WindhawkMod==
 
+// ==WindhawkModSettings==
+/*
+- layout:
+  - position: tray_left
+    $name: Where the tiles sit
+    $description: >-
+      The place on the taskbar the tiles are inserted into. Tray options need the
+      tray buttons to exist; taskbar options need the matching button to be
+      visible.
+    $options:
+    - taskbar_left_start: Taskbar - left of Start
+    - taskbar_right_start: Taskbar - right of Start
+    - taskbar_after_search_right: Taskbar - right of Search
+    - taskbar_after_taskview_right: Taskbar - right of Task View
+    - taskbar_after_widgets_left: Taskbar - left of Widgets
+    - taskbar_after_widgets_right: Taskbar - right of Widgets
+    - tray_left: Tray - far left
+    - tray_hidden_icons_right: Tray - right of the hidden icons button
+    - tray_before_omni_left: Tray - left of Network and Volume
+    - tray_before_clock: Tray - left of the clock
+    - tray_right: Tray - far right
+  - monitorMode: primary
+    $name: Which taskbar
+    $options:
+    - primary: Main display only
+    - all: Every taskbar
+    - specific: The monitor number below
+  - monitor: 1
+    $name: Monitor number
+    $description: >-
+      Used by "The monitor number below". 1 is the main display, counted the way
+      Windows lists them.
+- display:
+  - barMode: remaining
+    $name: What the rings show
+    $options:
+    - remaining: Quota left
+    - used: Quota used
+  - palette: default
+    $name: Ring colours
+    $options:
+    - default: Green, yellow, orange, red
+    - colorblind: Blue, light blue, amber, dark orange
+  - yellowThreshold: 50
+    $name: Yellow from
+    $description: >-
+      Usage percentage at which the ring turns yellow. Orange and red use the
+      values below.
+  - orangeThreshold: 75
+    $name: Orange from
+  - redThreshold: 90
+    $name: Red from
+  - paceMarkers: always
+    $name: Pace marker
+    $description: >-
+      The dot on the ring that says how far through the window the usage has
+      got. "Always" keeps it on the ring; "Off pace only" hides it while usage
+      sits within five points of the elapsed time; "Hidden" takes it off.
+    $options:
+    - always: Always
+    - off_pace: Off pace only
+    - hidden: Hidden
+  - flyoutMaterial: default
+    $name: Flyout material
+    $options:
+    - default: Theme tint over the wallpaper
+    - mica: Mica
+    - micaAlt: Mica Alt
+    - acrylic: Acrylic
+  - openFlyoutOnHover: false
+    $name: Open the flyout on hover
+    $description: >-
+      Opens the flyout when the pointer rests on a tile, without a click.
+- refresh:
+  - pollMinutes: 5
+    $name: Refresh every
+    $description: >-
+      Minutes between usage requests. Providers ask to ease off on their own when
+      the allowance is spent, and that back-off always wins.
+  - muteNotifications: false
+    $name: Turn notifications off
+  - notifyThreshold: 3
+    $name: Notify below
+    $description: >-
+      Percentage of quota left at which a window is worth a notification.
+*/
+// ==/WindhawkModSettings==
+
 // ==WindhawkModReadme==
 /*
 # Taskbar AI Usage
@@ -254,6 +342,7 @@ enum class Str : int {
     MenuSettings,
     MenuAddAnAIAccountStoredSettingsCould,
     MenuAddAnAIAccount,
+    MenuShow,
     // Settings window
     SettingsThresholdPercentage,
     SettingsResetNamedColor,
@@ -652,6 +741,14 @@ enum class Str : int {
     NaritUnexpectedAnswer,
     NaritUnreadable,
     NaritTryAnother,
+    LoginAddAccount,
+    LoginIntro,
+    LoginProvider,
+    LoginKeyHint,
+    LoginKeyRequired,
+    LoginWaiting,
+    LoginNoAccounts,
+    LoginFailed,
     Count,
 };
 
@@ -754,6 +851,7 @@ static const PCWSTR kStringsEn[] = {
     /* MenuSettings */ L"Settings...",
     /* MenuAddAnAIAccountStoredSettingsCould */ L"Add an AI account. Stored settings could not be read; a backup was kept.",
     /* MenuAddAnAIAccount */ L"Add an AI account",
+    /* MenuShow */ L"Show",
     /* SettingsThresholdPercentage */ L"Threshold {0} percentage",
     /* SettingsResetNamedColor */ L"Reset {0}",
     /* SettingsShowMore */ L"Show more settings",
@@ -1144,6 +1242,14 @@ static const PCWSTR kStringsEn[] = {
     /* NaritUnexpectedAnswer */ L"Unexpected answer from the server (HTTP {0}).",
     /* NaritUnreadable */ L"The key was accepted but the response could not be read.",
     /* NaritTryAnother */ L"Try again with a different key.",
+    /* LoginAddAccount */ L"Add an account",
+    /* LoginIntro */ L"NARIT asks for the API key below. The other providers open their own sign-in page in your browser.",
+    /* LoginProvider */ L"Provider",
+    /* LoginKeyHint */ L"API key (starts with sk-)",
+    /* LoginKeyRequired */ L"Paste the key first.",
+    /* LoginWaiting */ L"Checking the key...",
+    /* LoginNoAccounts */ L"Add your first account to start",
+    /* LoginFailed */ L"Could not add the account.",
 };
 // ==== END STRINGS en ====
 
@@ -1743,6 +1849,9 @@ static HANDLE g_stopEvent = nullptr;
 static HANDLE g_refreshEvent = nullptr;
 static HANDLE g_injectEvent = nullptr;
 static HANDLE g_fetchThread = nullptr;
+// Set by Wh_ModSettingsChanged, consumed by the fetch thread: the settings page's callback must return
+// immediately, so the reload happens off that thread.
+static std::atomic<bool> g_settingsReloadPending{false};
 static HANDLE g_retryThread = nullptr;
 static std::mutex g_retryThreadMutex;
 static std::atomic<bool> g_rebuildQuotaUiBeforeInject{false};
@@ -1797,7 +1906,14 @@ static std::vector<HWND> FindCurrentProcessTaskbarWnds();
 static QuotaUiInstance* FindUiState(HWND hWnd);
 static void UpdateQuotaUi(QuotaUiInstance& state);
 static void PostUiUpdate();
+// Applies a settings reload requested from Windhawk's settings page; defined next to LoadSettings.
+static void ApplyDeferredSettingsReload();
 static void OpenSettingsWindow();
+static void OpenAccountLoginWindow();
+// Defined with the settings window; the sign-in page reuses it to get a taskbar button of its own.
+static void SetSettingsWindowAppId(HWND window, bool set);
+static bool IsTaskbarLightTheme();
+static bool RemoveAccountByIdentity(uint64_t identityHash);
 static void SetVisualTestMode(bool enabled);
 static bool SaveOwnedSettings(const Settings& settings);
 static void PublishSettings(Settings settings, uint64_t oldIdentity = 0,
@@ -4584,6 +4700,25 @@ static std::wstring ShowLoginInputDialog(const std::wstring& title, const std::w
     CloseLoginInputDialog(wnd, st);
     return st.ok ? st.result : std::wstring();
 }
+
+/**********************************************/
+//  Add-account page
+/**********************************************/
+
+// A sign-in page and nothing else: pick a provider, and for NARIT paste the key. The label, the
+// arcs and the icon of a new account are chosen for the user, which is why the mod no longer needs
+// the settings window it used to paint itself.
+enum class AddAccountResult {
+    Added,
+    MissingKey,
+    Failed,
+};
+
+// Defined with the account helpers near the settings window: it writes the account into the stored
+// settings and starts the sign-in for the providers that use a browser.
+static AddAccountResult AddAccountAndSignIn(const std::wstring& provider, const std::wstring& key,
+                                            std::wstring* message);
+
 
 static bool StartLoopback(SOCKET* outSock, int* outPort) {
     for (int port : {1455, 1457}) {
@@ -8234,7 +8369,16 @@ static void FetchAccount(const AccountConfig& acc, AccountData* d, int* retryAft
 
 static void PostUiUpdate() {
     // Never resolve XAML refs on the fetch thread; marshal first.
-    if (g_unloading || !g_uiInjected.load(std::memory_order_acquire)) return;
+    if (g_unloading) return;
+    // Gate on real instances, not on the injection flag: after a settings change the grid is rebuilt
+    // while g_uiInjected is briefly false, and skipping the update there left new tiles painted with
+    // nothing until the next poll (they also refused to open their flyout, having no model yet).
+    bool haveInstance = false;
+    {
+        std::lock_guard<std::mutex> lk(g_uiInstancesMutex);
+        haveInstance = g_uiInstances && !g_uiInstances->empty();
+    }
+    if (!haveInstance) return;
 
     for (HWND hWnd : FindCurrentProcessTaskbarWnds()) {
         RunFromWindowThread(hWnd, [](void* param) -> bool {
@@ -8623,8 +8767,11 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
     ULONGLONG lastLoggedSettingsGeneration = 0;
     ClaudeUsageCacheReader claudeCache;
     bool hostsTaskbar = false;
-    bool detectionAsked = false;
     while (!g_unloading) {
+        if (g_settingsReloadPending.exchange(false, std::memory_order_acq_rel)) {
+            ApplyDeferredSettingsReload();
+            continue;
+        }
         // Without a taskbar in this process nothing is polled; it checks again every 10 s in case
         // the taskbar has not been created yet (Explorer startup).
         if (!hostsTaskbar && !(hostsTaskbar = CurrentProcessHostsTaskbar())) {
@@ -8632,16 +8779,9 @@ static DWORD WINAPI FetchThreadProc(LPVOID) {
             if (WaitForMultipleObjects(2, handles, FALSE, 10000) == WAIT_OBJECT_0) break;
             continue;
         }
-        // First run: Settings opens and asks before any other app's sign-in is read.
-        if (!detectionAsked) {
-            detectionAsked = true;
-            bool ask;
-            {
-                std::lock_guard<std::mutex> lk(g_settingsMutex);
-                ask = !g_settingsLoadError && g_settings.accountDetection == AccountDetection::Ask;
-            }
-            if (ask && !g_unloading) OpenSettingsWindow();
-        }
+        // No provider-detection prompt: it was the account manager's, it defaulted to "ask", and it
+        // ran its modal window on this thread before the first request - so every start opened a
+        // window nobody could reach and no account was ever polled.
         RevokePendingGoogleTokens();
         ULONGLONG refreshGeneration;
         uint64_t refreshAccountIdentity;
@@ -10385,7 +10525,9 @@ static AccountViewModel BuildAccountModel(AccountConfig const& account, AccountD
                           s.usageColors, s.useAccentUsageColor, s.usageAccent);
     };
     auto pacePct = [&](WindowUsage const& wu) -> double {
-        if (!s.showPaceTicks || stale || wu.pct < 0 || wu.windowDurationMs == 0 ||
+        // Staleness dims the ring and raises the warning on its own; the marker still says where
+        // in the window the last reading sat, so "always" means always.
+        if (!s.showPaceTicks || wu.pct < 0 || wu.windowDurationMs == 0 ||
             wu.resetUnixMs <= wu.windowDurationMs || now < wu.resetUnixMs - wu.windowDurationMs) {
             return -1;
         }
@@ -11363,6 +11505,63 @@ static void ApplyNativeFlyoutMica(QuotaUiInstance& state, Grid const& layout,
 }
 
 // Builds the flyout content and records its references in state.flyout.
+// The commands the tile's + button and every tile's right-click menu share: a submenu per account
+// with sign-in and remove, then Add account.
+static void AppendAccountCommands(QuotaUiInstance& state, HWND hWnd, MenuFlyout& menu,
+                                  std::vector<AccountConfig> const& accounts) {
+    for (size_t k = 0; k < accounts.size(); k++) {
+        AccountConfig const& account = accounts[k];
+        uint64_t hash = AccountIdentityHash(account);
+        MenuFlyoutSubItem row;
+        row.Text(winrt::hstring(account.label));
+        // Visibility lives with the account it belongs to: Show, checked while the tile is on the
+        // taskbar. The separate list of account checkboxes it used to be is gone.
+        ToggleMenuFlyoutItem showItem;
+        showItem.Text(Tr(Str::MenuShow));
+        showItem.IsChecked(!account.hidden);
+        auto showToken = showItem.Click(
+            [hash](winrt::Windows::Foundation::IInspectable const& sender, RoutedEventArgs const&) {
+                ToggleAccountVisibility(hash, sender);
+            });
+        state.menuItemClickHandlers.push_back({showItem, showToken});
+        // Registered so the other menus' checkmarks follow a change made here.
+        state.accountToggleItems.push_back({(int)k, showItem});
+        row.Items().Append(showItem);
+        MenuFlyoutItem signInAgain;
+        signInAgain.Text(Tr(Str::CommonSignIn));
+        auto signInToken = signInAgain.Click(
+            [hash, hWnd](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
+                if (g_unloading) return;
+                if (auto* s = FindUiState(hWnd)) CloseAccountFlyout(*s);
+                StartLoginByIdentity(hash);
+            });
+        state.menuItemClickHandlers.push_back({signInAgain, signInToken});
+        MenuFlyoutItem remove;
+        remove.Text(Tr(Str::SettingsRemove));
+        auto removeToken = remove.Click(
+            [hash, hWnd](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
+                if (g_unloading) return;
+                if (auto* s = FindUiState(hWnd)) CloseAccountFlyout(*s);
+                RemoveAccountByIdentity(hash);
+            });
+        state.menuItemClickHandlers.push_back({remove, removeToken});
+        row.Items().Append(signInAgain);
+        row.Items().Append(remove);
+        menu.Items().Append(row);
+    }
+    if (!accounts.empty()) menu.Items().Append(MenuFlyoutSeparator{});
+    MenuFlyoutItem addItem;
+    addItem.Text(Tr(Str::LoginAddAccount));
+    auto addToken = addItem.Click(
+        [hWnd](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
+            if (g_unloading) return;
+            if (auto* s = FindUiState(hWnd)) CloseAccountFlyout(*s);
+            OpenAccountLoginWindow();
+        });
+    state.menuItemClickHandlers.push_back({addItem, addToken});
+    menu.Items().Append(addItem);
+}
+
 static FrameworkElement BuildFlyoutContent(QuotaUiInstance& state, int accountIndex) {
     AccountViewModel const& m = state.models[accountIndex];
     UiPalette pal = GetUiPalette(state.lightTheme);
@@ -11691,14 +11890,20 @@ static FrameworkElement BuildFlyoutContent(QuotaUiInstance& state, int accountIn
             RefreshQuotaByIdentity(identity);
         });
     buttons.Children().Append(refresh);
-    Button settings = MakeFlyoutIconButton(state, L"", Tr(Str::CommonSettings), pal);
-    AddFlyoutClick(state, settings,
-        [hWnd](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
-            if (g_unloading) return;
-            if (auto* s = FindUiState(hWnd)) CloseAccountFlyout(*s);
-            OpenSettingsWindow();
-        });
-    buttons.Children().Append(settings);
+    // The gear became a plus: accounts are added here, and each row carries its own sign-in and
+    // remove commands, which is all the old settings window was still needed for.
+    Button addAccount = MakeFlyoutIconButton(state, L"", Tr(Str::LoginAddAccount), pal);
+    {
+        MenuFlyout addMenu;
+        std::vector<AccountConfig> menuAccounts;
+        {
+            std::lock_guard<std::mutex> lk(g_settingsMutex);
+            menuAccounts = g_settings.accounts;
+        }
+        AppendAccountCommands(state, hWnd, addMenu, menuAccounts);
+        addAccount.Flyout(addMenu);
+    }
+    buttons.Children().Append(addAccount);
     footerGrid.Children().Append(buttons);
     footer.Child(footerGrid);
     layout.Children().Append(footer);
@@ -12156,7 +12361,7 @@ static void ClearQuotaEventState(QuotaUiInstance& state) {
 }
 
 // Context menu of a tile (same as the original mod's).
-static MenuFlyout BuildTileContextMenu(QuotaUiInstance& state,
+static MenuFlyout BuildTileContextMenu(QuotaUiInstance& state, HWND hWnd,
                                        std::vector<AccountConfig> const& accounts,
                                        uint64_t accountIdentity, bool hasDashboard,
                                        bool visualTestMode) {
@@ -12202,38 +12407,11 @@ static MenuFlyout BuildTileContextMenu(QuotaUiInstance& state,
         menu.Items().Append(dashboardItem);
     }
 
-    if (!visualTestMode) {
-        // Per-account show/hide checkboxes (checked = visible). Every tile carries the
-        // same list; toggling flips global state, persists, and re-syncs all instances.
-        menu.Items().Append(MenuFlyoutSeparator{});
-        for (size_t k = 0; k < accounts.size(); k++) {
-            ToggleMenuFlyoutItem toggle;
-            toggle.Text(accounts[k].label + L" - " + ProviderDisplayName(accounts[k].provider));
-            toggle.IsChecked(!accounts[k].hidden);
-            int toggleIndex = (int)k;
-            uint64_t toggleIdentity = AccountIdentityHash(accounts[k]);
-            auto toggleToken = toggle.Click(
-                [toggleIdentity](winrt::Windows::Foundation::IInspectable const& sender,
-                                 RoutedEventArgs const&) {
-                    ToggleAccountVisibility(toggleIdentity, sender);
-                });
-            state.menuItemClickHandlers.push_back({toggle, toggleToken});
-            state.accountToggleItems.push_back({toggleIndex, toggle});
-            menu.Items().Append(toggle);
-        }
-        // Sign in and sign out are no longer in this menu: they are done from Settings > Accounts
-        // (or by clicking a signed-out tile).
-    }
+    // The per-account Show / Sign in / Remove commands are appended below, one submenu per account.
 
+    // The same account commands as the + button, so every tile can add and remove accounts.
     menu.Items().Append(MenuFlyoutSeparator{});
-    MenuFlyoutItem settingsItem;
-    settingsItem.Text(Tr(Str::MenuSettings));
-    auto settingsToken = settingsItem.Click(
-        [](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
-            OpenSettingsWindow();
-        });
-    state.menuItemClickHandlers.push_back({settingsItem, settingsToken});
-    menu.Items().Append(settingsItem);
+    AppendAccountCommands(state, hWnd, menu, accounts);
     return menu;
 }
 
@@ -12299,24 +12477,28 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             setupTile.Content(plus);
             auto token = setupTile.Click(
                 [](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
-                    OpenSettingsWindow();
+                    OpenAccountLoginWindow();
                 });
             state.tileClicks.push_back({setupTile, token});
             std::wstring setupLabel = g_settingsLoadError.load() ?
-                Tr(Str::MenuAddAnAIAccountStoredSettingsCould) : Tr(Str::MenuAddAnAIAccount);
+                Tr(Str::MenuAddAnAIAccountStoredSettingsCould) : Tr(Str::LoginNoAccounts);
             ToolTipService::SetToolTip(setupTile, winrt::box_value(setupLabel));
             winrt::Windows::UI::Xaml::Automation::AutomationProperties::SetName(
                 setupTile, setupLabel);
 
             MenuFlyout menu;
-            MenuFlyoutItem settingsItem;
-            settingsItem.Text(Tr(Str::MenuSettings));
-            auto settingsToken = settingsItem.Click(
+            MenuFlyoutItem promptItem;
+            promptItem.Text(Tr(Str::LoginNoAccounts));
+            promptItem.IsEnabled(false);
+            menu.Items().Append(promptItem);
+            MenuFlyoutItem addItem;
+            addItem.Text(Tr(Str::LoginAddAccount));
+            auto addToken = addItem.Click(
                 [](winrt::Windows::Foundation::IInspectable const&, RoutedEventArgs const&) {
-                    OpenSettingsWindow();
+                    OpenAccountLoginWindow();
                 });
-            state.menuItemClickHandlers.push_back({settingsItem, settingsToken});
-            menu.Items().Append(settingsItem);
+            state.menuItemClickHandlers.push_back({addItem, addToken});
+            menu.Items().Append(addItem);
             setupTile.ContextFlyout(menu);
 
             panel.Children().Append(setupTile);
@@ -12459,7 +12641,7 @@ static Grid BuildQuotaGrid(QuotaUiInstance& state) {
             }
 
             bool hasDashboard = !visualTestMode && accounts[i].provider != L"antigravity";
-            tile.ContextFlyout(BuildTileContextMenu(state, accounts, refs.identity,
+            tile.ContextFlyout(BuildTileContextMenu(state, hWnd, accounts, refs.identity,
                                                     hasDashboard, visualTestMode));
 
             panel.Children().Append(tile);
@@ -12560,8 +12742,21 @@ static void UpdateQuotaUi(QuotaUiInstance& state) {
             bool accountRefreshing = !visualTestMode && refreshing &&
                 (!refreshAccountIdentity ||
                  AccountIdentityHash(accounts[i]) == refreshAccountIdentity);
-            state.models.push_back(BuildAccountModel(accounts[i], data[i], snapshot, now,
-                                                     accountRefreshing, visualTestMode));
+            // One account with bad data must not blank the other tiles.
+            try {
+                state.models.push_back(BuildAccountModel(accounts[i], data[i], snapshot, now,
+                                                         accountRefreshing, visualTestMode));
+            } catch (winrt::hresult_error const&) {
+                if (state.models.size() <= i) {
+                    AccountViewModel fallback;
+                    fallback.provider = accounts[i].provider;
+                    fallback.label = accounts[i].label;
+                    fallback.identity = AccountIdentityHash(accounts[i]);
+                    fallback.error = L"Could not read this account's data";
+                    state.models.push_back(std::move(fallback));
+                }
+                continue;
+            }
             AccountViewModel const& m = state.models.back();
             AppliedState& ap = state.applied[i];
             AccountUiRefs const& ui = state.accountRefs[i];
@@ -13326,13 +13521,20 @@ static DWORD WINAPI RetryInjectThreadProc(LPVOID) {
     };
     bool stopping = false;
     while (!g_unloading) {
-        DWORD startWait = waitWithMessages(INFINITE);
+        // A timeout is a wake-up too: after explorer starts, the taskbar island can still be missing
+        // when the first attempt series ends, and nothing else signals this thread afterwards - the
+        // tiles then stay frozen until the user reloads the mod by hand.
+        DWORD startWait = waitWithMessages(3000);
         if (startWait == WAIT_OBJECT_0 || g_unloading) break;
         if (startWait == WAIT_OBJECT_0 + 2) continue;
-        if (startWait != WAIT_OBJECT_0 + 1) continue;
+        if (startWait == WAIT_TIMEOUT && g_uiInjected.load(std::memory_order_acquire)) continue;
+        if (startWait != WAIT_OBJECT_0 + 1 && startWait != WAIT_TIMEOUT) continue;
 
         ULONGLONG settleUntil = 0;
-        for (int attempt = 0; attempt < 600 && !g_unloading; attempt++) {
+        // Keep polling instead of giving up after a fixed number of tries: after an explorer restart
+        // the tray island can appear long after the first attempt, and a worker that had already
+        // exited left the tiles frozen until the next TrayUI::StartTaskbar - which may never come.
+        for (int attempt = 0; !g_unloading; attempt++) {
             if (g_rebuildQuotaUiBeforeInject.exchange(false)) {
                 settleUntil = GetTickCount64() + 2000;
             }
@@ -13378,7 +13580,11 @@ static DWORD WINAPI RetryInjectThreadProc(LPVOID) {
                 allInjected = allInjected && injected;
             }
 
-            DWORD waitMs = allInjected ? 0 : 100;
+            // Poll fast while the taskbar is still coming up, then once a second once it is clear
+            // this is not a cold-start delay.
+            // Back off: every attempt installs a hook and sends a message to the taskbar thread, so
+            // hammering it for a minute is what made explorer look hung.
+            DWORD waitMs = allInjected ? 0 : (attempt < 100 ? 100 : attempt < 300 ? 500 : 2000);
             DWORD retryWait = waitWithMessages(waitMs);
             if (retryWait == WAIT_OBJECT_0 || g_unloading) {
                 stopping = true;
@@ -14039,6 +14245,68 @@ static bool ApplyDetectedCliLogins(Settings* s) {
     return changed;
 }
 
+// The tunables live in Windhawk's own settings page (the WindhawkModSettings block above), because
+// that page already has defaults, validation and a place users look. Accounts and tokens cannot go
+// there, so they stay in the mod's storage.
+static std::wstring ModSettingText(PCWSTR key) {
+    PCWSTR value = Wh_GetStringSetting(key);
+    std::wstring text = value ? value : L"";
+    Wh_FreeStringSetting(value);
+    return text;
+}
+
+// Six hex digits, red green blue, written without the # sign.
+static COLORREF ModSettingColor(PCWSTR key, COLORREF fallback) {
+    std::wstring text = ModSettingText(key);
+    if (text.size() != 6) return fallback;
+    wchar_t* end = nullptr;
+    unsigned long value = wcstoul(text.c_str(), &end, 16);
+    if (!end || *end || value > 0xFFFFFF) return fallback;
+    return RGB((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
+}
+
+static void ApplyModSettings(Settings* s) {
+    s->tilePosition = TilePositionFromId(ModSettingText(L"layout.position"));
+    std::wstring monitorMode = ModSettingText(L"layout.monitorMode");
+    s->taskbarMonitorMode = monitorMode == L"all" ? TaskbarMonitorMode::All :
+                            monitorMode == L"specific" ? TaskbarMonitorMode::Specific :
+                                                         TaskbarMonitorMode::Primary;
+    // A setting nobody has saved reads back as 0, so every knob whose 0 is not a real choice falls
+    // back to the shipped default here instead of trusting the block alone.
+    s->taskbarMonitorNumber = std::max(1, (int)Wh_GetIntSetting(L"layout.monitor"));
+    // Tile size, the gaps around it and the marker's colour are fixed now: the tray already sizes the
+    // tile, and a colour that could be set to anything only got in the way of reading the ring.
+
+    s->barMode = ModSettingText(L"display.barMode") == L"used" ? BarMode::Used : BarMode::Remaining;
+    s->usageColors = ModSettingText(L"display.palette") == L"colorblind" ? kAccessibleUsageColors
+                                                                       : kDefaultUsageColors;
+    s->yellowThreshold = Wh_GetIntSetting(L"display.yellowThreshold") > 0
+                             ? (int)Wh_GetIntSetting(L"display.yellowThreshold") : 50;
+    s->orangeThreshold = Wh_GetIntSetting(L"display.orangeThreshold") > 0
+                             ? (int)Wh_GetIntSetting(L"display.orangeThreshold") : 75;
+    s->redThreshold = Wh_GetIntSetting(L"display.redThreshold") > 0
+                          ? (int)Wh_GetIntSetting(L"display.redThreshold") : 90;
+    // The marker is the one thing that says "you are here": on by default, and a stored 0 means
+    // nobody has chosen yet, so the choice is read as text where the empty string is the default.
+    std::wstring markers = ModSettingText(L"display.paceMarkers");
+    s->showPaceTicks = markers != L"hidden";
+    s->persistentPaceMarkers = markers != L"off_pace";
+    // The ring keeps its own colours while it warns about the data and shows an amount for a bar that
+    // is money: those were choices nobody needed, and the first two fought the ring's own reading.
+    std::wstring material = ModSettingText(L"display.flyoutMaterial");
+    s->flyoutMaterial = material == L"micaAlt" ? FlyoutMaterial::MicaAlt :
+                        material == L"mica" ? FlyoutMaterial::Mica :
+                        material == L"acrylic" ? FlyoutMaterial::Acrylic : FlyoutMaterial::Default;
+    s->openFlyoutOnHover = Wh_GetIntSetting(L"display.openFlyoutOnHover") != 0;
+
+    s->pollMinutes = Wh_GetIntSetting(L"refresh.pollMinutes") > 0
+                        ? (int)Wh_GetIntSetting(L"refresh.pollMinutes") : 5;
+    // Off is its own switch: a stored 0 would otherwise be indistinguishable from "never saved".
+    bool mute = Wh_GetIntSetting(L"refresh.muteNotifications") != 0;
+    int notifyBelow = (int)Wh_GetIntSetting(L"refresh.notifyThreshold");
+    s->notifyThreshold = mute ? 0 : std::max(1, notifyBelow > 0 ? notifyBelow : 3);
+}
+
 static void LoadSettings() {
     bool apartmentInitialized = false;
     try {
@@ -14068,8 +14336,29 @@ static void LoadSettings() {
         NormalizeSettings(&s);
         if (!SaveOwnedSettings(s)) Wh_Log(L"Could not save detected CLI sign-ins");
     }
+    // Windhawk's settings win over whatever a stored account blob still carries for the same knob.
+    ApplyModSettings(&s);
+    NormalizeSettings(&s);
+    Wh_Log(L"Settings: %d account(s), poll %d min, tile size %d", (int)s.accounts.size(),
+           s.pollMinutes, s.tileSize);
     PublishSettings(std::move(s));
     if (apartmentInitialized) winrt::uninit_apartment();
+}
+
+// Windhawk's settings page saves the values into the mod's registry key and then calls this. Without
+// it the mod kept whatever it had read when it loaded: the page said "saved", the tiles did not
+// move. Reload (storage + the Windhawk block) and apply it to the live taskbar.
+static void ApplyDeferredSettingsReload() {
+    LoadSettings();             // storage + the Windhawk block, then publish (bumps the generation)
+    FinishSettingsApply(false); // repaint the tiles, or rebuild them if the layout changed
+}
+
+void Wh_ModSettingsChanged() {
+    // Runs on Windhawk's thread, which waits for it to return, so only raise the flag and wake the
+    // fetch thread. Reloading storage and rebuilding the tiles there would block the settings page.
+    if (g_unloading) return;
+    g_settingsReloadPending.store(true, std::memory_order_release);
+    if (g_refreshEvent) SetEvent(g_refreshEvent);
 }
 
 /**********************************************/
@@ -17642,8 +17931,8 @@ struct SettingsDialogState {
     HWND owner = nullptr;
     HWND smoke = nullptr;
     NativeTheme theme;
-    HFONT titleFont = nullptr;
     UINT dpi = 96;
+    HFONT titleFont = nullptr;
     std::wstring title, text;
     struct Button { int id; std::wstring label; };
     std::vector<Button> buttons;
@@ -23607,6 +23896,7 @@ static LRESULT CALLBACK AppearanceReviewWndProc(HWND hWnd, UINT message, WPARAM 
     return DefWindowProcW(hWnd, message, wParam, lParam);
 }
 
+
 // Modal review dialog. Returns true only if "Apply" is confirmed.
 static bool ShowAppearanceReview(HWND owner, const std::wstring& text, bool canApply) {
     if (g_unloading || !IsWindow(owner)) return false;
@@ -25520,6 +25810,573 @@ static bool ShowAccountEditor(HWND owner, AccountConfig* account, bool adding) {
     if (state.accepted) *account = std::move(state.account);
     ReleaseIconPins();
     return state.accepted;
+}
+
+// Adds the account the sign-in page asked for and starts its sign-in. NARIT is checked here
+// because its "sign-in" is the key itself: it is only stored once /key/info has accepted it.
+static AddAccountResult AddAccountAndSignIn(const std::wstring& provider, const std::wstring& key,
+                                            std::wstring* message) {
+    if (!IsKnownProvider(provider)) {
+        *message = Tr(Str::LoginFailed);
+        return AddAccountResult::Failed;
+    }
+    std::wstring trimmedKey;
+    if (provider == L"narit") {
+        size_t first = key.find_first_not_of(L" \t\r\n");
+        size_t last = key.find_last_not_of(L" \t\r\n");
+        if (first == std::wstring::npos) return AddAccountResult::MissingKey;
+        trimmedKey = key.substr(first, last - first + 1);
+        bool printable = trimmedKey.size() <= 512 &&
+            std::all_of(trimmedKey.begin(), trimmedKey.end(),
+                        [](wchar_t c) { return c > 0x20 && c < 0x7F; });
+        if (!printable) {
+            WipeBuffer(trimmedKey);
+            *message = Tr(Str::NaritNotAKey);
+            return AddAccountResult::Failed;
+        }
+    }
+
+    AccountConfig account;
+    account.provider = provider;
+    {
+        std::unique_lock<std::mutex> configLock(g_configEditMutex);
+        Settings settings;
+        {
+            std::lock_guard<std::mutex> lk(g_settingsMutex);
+            settings = g_settings;
+        }
+        account.label = DefaultAccountLabel(settings, provider);
+        settings.accounts.push_back(account);
+        SettingsApplyResult applyResult = ApplyOwnedSettings(std::move(settings));
+        configLock.unlock();
+        if (applyResult == SettingsApplyResult::Failed) {
+            WipeBuffer(trimmedKey);
+            *message = Tr(Str::LoginFailed);
+            return AddAccountResult::Failed;
+        }
+        if (applyResult == SettingsApplyResult::Changed) FinishSettingsApply();
+    }
+
+    uint64_t identityHash = AccountIdentityHash(account);
+    if (provider != L"narit") {
+        // The browser flows (and their paste dialogs) keep running in their own thread.
+        StartLoginByIdentity(identityHash);
+        return AddAccountResult::Added;
+    }
+
+    HttpResult probe = NaritRequestKeyInfo(trimmedKey);
+    NaritKeyInfo parsed;
+    NaritParseError probeError = NaritParseError::None;
+    bool accepted = probe.ok && probe.status == 200 &&
+                    ParseNaritKeyInfo(probe.body, &parsed, &probeError);
+    if (!accepted) {
+        WipeBuffer(trimmedKey);
+        // The account stays, unsigned in, so the key can be tried again from the tile.
+        *message = !probe.ok ? Tr(Str::NaritUnreachable) :
+                   probe.status == 401 || probe.status == 403 ? Tr(Str::NaritRejectedShort) :
+                   probe.status == 429 ? Tr(Str::StatusRateLimitedByAPI) :
+                   TrFormat(Str::StatusHttp, {std::to_wstring(probe.status)});
+        RefreshQuotaByIdentity(identityHash);
+        return AddAccountResult::Failed;
+    }
+    StoredToken token;
+    token.accessToken = trimmedKey;
+    WipeBuffer(trimmedKey);
+    if (SaveStoredTokenIfCurrent(identityHash, CurrentAuthEpoch(identityHash), token) !=
+        TokenSaveResult::Saved) {
+        WipeBuffer(token.accessToken);
+        *message = Tr(Str::NaritStoreFailed);
+        return AddAccountResult::Failed;
+    }
+    WipeBuffer(token.accessToken);
+    RefreshQuotaByIdentity(identityHash);
+    return AddAccountResult::Added;
+}
+
+// ---- Sign-in page -----------------------------------------------------------------------------
+// Built like the account editor: label on the left, Fluent control on the right, captions in
+// Body/Caption under the rows, accent button in the footer, real DWM frame around it.
+static constexpr int kLoginClientWidth = 460;
+static constexpr int kLoginClientHeight = 340;
+
+struct AccountLoginState {
+    NativeTheme theme;
+    NativeBackdrop backdrop;
+    UINT dpi = 96;
+    RECT card{};
+    RECT keyFrame{};
+    int footerTop = 0;
+    HWND providerCombo = nullptr;
+    HWND keyLabel = nullptr;
+    HWND keyEdit = nullptr;
+    HWND status = nullptr;
+    std::vector<std::wstring> providers;
+    bool done = false;
+    bool accepted = false;
+    bool updatingVisuals = false;
+};
+
+static constexpr int kLoginProviderLabelId = 99;
+static constexpr int kLoginIntroId = 100;
+static constexpr int kLoginProviderId = 101;
+static constexpr int kLoginKeyLabelId = 102;
+static constexpr int kLoginKeyId = 103;
+static constexpr int kLoginStatusId = 104;
+
+static std::wstring LoginSelectedProvider(AccountLoginState& state) {
+    int index = (int)SendMessageW(state.providerCombo, CB_GETCURSEL, 0, 0);
+    if (index < 0 || index >= (int)state.providers.size()) return L"narit";
+    return state.providers[index];
+}
+
+static std::wstring LoginEditText(HWND edit) {
+    int length = GetWindowTextLengthW(edit);
+    std::wstring text(length + 1, L'\0');
+    GetWindowTextW(edit, text.data(), length + 1);
+    text.resize(length);
+    return text;
+}
+
+// Only NARIT signs in with a key; the other providers open their own web page.
+static void ShowLoginKeyRow(HWND hWnd, AccountLoginState& state, bool show) {
+    for (HWND control : {state.keyLabel, state.keyEdit}) {
+        if (control) ShowWindow(control, show ? SW_SHOW : SW_HIDE);
+    }
+    if (!show) {
+        if (state.status) SetWindowTextW(state.status, L"");
+    } else {
+        state.keyFrame = {};
+    }
+    InvalidateRect(hWnd, nullptr, FALSE);
+}
+
+static void LayoutAccountLogin(HWND hWnd, AccountLoginState& state) {
+    RECT client{};
+    GetClientRect(hWnd, &client);
+    auto sc = [&](int value) { return ScaleForDpi(value, state.dpi); };
+    constexpr UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    // The caption is painted inside the client area (InstallNativeCaption), so the page starts
+    // below it.
+    int page = sc(kNativeCaptionHeight) + sc(16);
+    state.footerTop = client.bottom - sc(56);
+    state.card = {sc(16), page, client.right - sc(16), state.footerTop - sc(16)};
+    int left = state.card.left + sc(16);
+    int width = state.card.right - sc(16) - left;
+
+    SetWindowPos(GetDlgItem(hWnd, kLoginIntroId), nullptr, left, page + sc(12), width, sc(38),
+                 flags);
+    SetWindowPos(GetDlgItem(hWnd, kLoginProviderLabelId), nullptr, left, page + sc(56),
+                 width, sc(18), flags);
+    SetWindowPos(state.providerCombo, nullptr, left, page + sc(76), width, sc(200), flags);
+    SetWindowPos(state.keyLabel, nullptr, left, page + sc(120), width, sc(18), flags);
+    state.keyFrame = {left, page + sc(140), left + width, page + sc(140) + sc(30)};
+    SetWindowPos(state.keyEdit, nullptr, left + sc(8), page + sc(144), width - sc(16), sc(22),
+                 flags);
+    SetWindowPos(state.status, nullptr, left, page + sc(176), width, sc(30), flags);
+
+    int buttonHeight = sc(32);
+    int buttonWidth = sc(96);
+    int buttonY = state.footerTop + (sc(56) - buttonHeight) / 2;
+    SetWindowPos(GetDlgItem(hWnd, IDCANCEL), nullptr, (int)client.right - sc(16) - buttonWidth,
+                 buttonY, buttonWidth, buttonHeight, flags);
+    SetWindowPos(GetDlgItem(hWnd, IDOK), nullptr,
+                 (int)client.right - sc(16) - buttonWidth * 2 - sc(8), buttonY, buttonWidth,
+                 buttonHeight, flags);
+}
+
+static void PaintAccountLogin(HWND hWnd, AccountLoginState& state, HDC target) {
+    RECT client{};
+    GetClientRect(hWnd, &client);
+    if (client.right <= 0 || client.bottom <= 0) return;
+    const NativeTheme& t = state.theme;
+    auto sc = [&](int value) { return ScaleForDpi(value, state.dpi); };
+    NativeBackdropPaint buffer(hWnd, target, client, t.back, state.backdrop);
+    HDC dc = buffer.dc;
+    int saved = SaveDC(dc);
+    IntersectClipRect(dc, 0, sc(kNativeCaptionHeight), client.right, client.bottom);
+    if (state.card.right > state.card.left && state.card.bottom > state.card.top) {
+        SmoothRoundRect(dc, state.card, sc(kSettingsCardRadius), t.card, t.cardBorder);
+        buffer.Card(state.card, t);
+    }
+    if (IsWindowVisible(state.keyEdit)) {
+        PaintInputFrame(dc, t, state.dpi, state.keyFrame, state.keyEdit);
+        buffer.Input(state.keyFrame, t, state.keyEdit);
+    }
+    RECT footer{0, state.footerTop, client.right, client.bottom};
+    if (!state.backdrop.enabled) FillSolid(dc, footer, t.footer);
+    PaintFluentFocusVisual(hWnd, dc, t, false);
+    RestoreDC(dc, saved);
+    buffer.Finish(state.backdrop.enabled ? RECT{} : footer);
+}
+
+static void RecreateAccountLoginVisuals(HWND hWnd, AccountLoginState& state) {
+    if (state.updatingVisuals || g_unloading) return;
+    state.updatingVisuals = true;
+    BuildNativeTheme(state.theme, state.dpi);
+    const NativeTheme& t = state.theme;
+    state.backdrop.childBackground = t.card;
+    EnumChildWindows(hWnd, [](HWND child, LPARAM param) -> BOOL {
+        SendMessageW(child, WM_SETFONT, param, FALSE);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(t.body));
+    for (int id : {kLoginKeyLabelId}) {
+        SendDlgItemMessageW(hWnd, id, WM_SETFONT, (WPARAM)t.rowTitle, FALSE);
+    }
+    SendDlgItemMessageW(hWnd, kLoginIntroId, WM_SETFONT, (WPARAM)t.caption, FALSE);
+    SendDlgItemMessageW(hWnd, kLoginStatusId, WM_SETFONT, (WPARAM)t.caption, FALSE);
+    ApplyFluentComboMetrics(state.providerCombo, state.dpi);
+    InstallNativeCaption(hWnd, t, false, &state.backdrop);
+    InstallFluentFocusTracking(hWnd);
+    ApplyNativeWindowTheme(hWnd, t.dark, t.highContrast, &state.backdrop);
+    SetWindowTheme(hWnd, t.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    RedrawWindow(hWnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    state.updatingVisuals = false;
+}
+
+static LRESULT CALLBACK AccountLoginWndProc(HWND hWnd, UINT message, WPARAM wParam,
+                                            LPARAM lParam) {
+    auto* state = reinterpret_cast<AccountLoginState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    switch (message) {
+        case WM_CREATE: {
+            auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            state = reinterpret_cast<AccountLoginState*>(create->lpCreateParams);
+            SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+            state->dpi = WindowDpi(hWnd);
+            HINSTANCE instance = GetModuleHandleW(nullptr);
+            // Everything is created at zero size: LayoutAccountLogin gives the real geometry.
+            CreateWindowExW(0, L"STATIC", Tr(Str::LoginIntro), WS_CHILD | WS_VISIBLE | SS_LEFT,
+                            0, 0, 1, 1, hWnd,
+                            reinterpret_cast<HMENU>((INT_PTR)kLoginIntroId), instance, nullptr);
+            CreateWindowExW(0, L"STATIC", Tr(Str::CommonProvider), WS_CHILD | WS_VISIBLE,
+                            0, 0, 1, 1, hWnd,
+                            reinterpret_cast<HMENU>((INT_PTR)kLoginProviderLabelId), instance,
+                            nullptr);
+            constexpr DWORD comboStyle = WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST |
+                                         CBS_OWNERDRAWFIXED | CBS_HASSTRINGS;
+            state->providerCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                                   comboStyle | WS_VISIBLE, 0, 0, 1, 1, hWnd,
+                                                   reinterpret_cast<HMENU>((INT_PTR)kLoginProviderId),
+                                                   instance, nullptr);
+            InstallFluentCombo(state->providerCombo, &state->theme);
+            state->keyLabel = CreateWindowExW(0, L"STATIC", Tr(Str::LoginKeyHint),
+                                              WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, hWnd,
+                                              reinterpret_cast<HMENU>((INT_PTR)kLoginKeyLabelId),
+                                              instance, nullptr);
+            state->keyEdit = CreateWindowExW(0, L"EDIT", L"",
+                                             WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                                 ES_AUTOHSCROLL | ES_PASSWORD,
+                                             0, 0, 1, 1, hWnd,
+                                             reinterpret_cast<HMENU>((INT_PTR)kLoginKeyId),
+                                             instance, nullptr);
+            SendMessageW(state->keyEdit, EM_SETLIMITTEXT, 512, 0);
+            state->status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_LEFT,
+                                            0, 0, 1, 1, hWnd,
+                                            reinterpret_cast<HMENU>((INT_PTR)kLoginStatusId),
+                                            instance, nullptr);
+            CreateWindowExW(0, L"BUTTON", Tr(Str::CommonSignIn),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 0, 0, 1, 1,
+                            hWnd, reinterpret_cast<HMENU>((INT_PTR)IDOK), instance, nullptr);
+            CreateWindowExW(0, L"BUTTON", Tr(Str::CommonCancel),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 1, 1, hWnd,
+                            reinterpret_cast<HMENU>((INT_PTR)IDCANCEL), instance, nullptr);
+            for (const std::wstring& provider : state->providers) {
+                int index = (int)SendMessageW(state->providerCombo, CB_ADDSTRING, 0,
+                                              (LPARAM)ProviderDisplayName(provider));
+                SendMessageW(state->providerCombo, CB_SETITEMDATA, index,
+                             (LPARAM)provider.c_str());
+            }
+            SendMessageW(state->providerCombo, CB_SETCURSEL, 0, 0);
+            ShowLoginKeyRow(hWnd, *state, LoginSelectedProvider(*state) == L"narit");
+            // Geometry first: the theme pass redraws the window, and the paint needs the card.
+            LayoutAccountLogin(hWnd, *state);
+            RecreateAccountLoginVisuals(hWnd, *state);
+            LayoutAccountLogin(hWnd, *state);
+            SetFocus(state->keyEdit);
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT paint;
+            HDC dc = BeginPaint(hWnd, &paint);
+            if (state) PaintAccountLogin(hWnd, *state, dc);
+            EndPaint(hWnd, &paint);
+            return 0;
+        }
+        case WM_MEASUREITEM:
+            if (auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+                measure && measure->CtlType == ODT_COMBOBOX) {
+                measure->itemHeight = FluentComboItemHeight(WindowDpi(hWnd),
+                                                            measure->itemID == (UINT)-1);
+                return TRUE;
+            }
+            break;
+        case WM_DRAWITEM:
+            if (auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+                state && draw && draw->CtlType == ODT_COMBOBOX) {
+                DrawFluentComboItem(state->theme, draw);
+                return TRUE;
+            }
+            break;
+        case WM_NOTIFY:
+            if (state && reinterpret_cast<NMHDR*>(lParam)->code == NM_CUSTOMDRAW) {
+                auto* draw = reinterpret_cast<NMCUSTOMDRAW*>(lParam);
+                wchar_t className[16] = {};
+                GetClassNameW(draw->hdr.hwndFrom, className, ARRAYSIZE(className));
+                if (_wcsicmp(className, L"Button") != 0) break;
+                int id = GetDlgCtrlID(draw->hdr.hwndFrom);
+                if (id == IDOK || id == IDCANCEL) {
+                    return PaintFluentButton(state->theme, state->dpi, draw,
+                                             id == IDOK ? FluentButtonKind::Accent
+                                                        : FluentButtonKind::Push,
+                                             state->theme.footer);
+                }
+            }
+            break;
+        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORBTN:
+            if (state && state->theme.cardBrush) {
+                NativeChildCardSurface(reinterpret_cast<HWND>(lParam), state->theme);
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                SetTextColor(dc, GetDlgCtrlID(reinterpret_cast<HWND>(lParam)) == kLoginStatusId
+                                     ? BlendColor(state->theme.textSecondary, state->theme.card)
+                                     : state->theme.textOnCard);
+                SetBkColor(dc, state->theme.card);
+                return reinterpret_cast<LRESULT>(state->theme.cardBrush);
+            }
+            break;
+        case WM_CTLCOLOREDIT:
+            if (state && state->theme.inputBrush) {
+                const NativeTheme& t = state->theme;
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                NativeChildControlSurface(reinterpret_cast<HWND>(lParam), t, t.input, {}, t.input,
+                                          false);
+                SetTextColor(dc, t.textOnCard);
+                SetBkColor(dc, t.input);
+                SetDCBrushColor(dc, t.input);
+                return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+            }
+            break;
+        case WM_CTLCOLORLISTBOX:
+            if (state && state->theme.popupBrush) {
+                SetTextColor(reinterpret_cast<HDC>(wParam), UiColorRef(state->theme.text));
+                SetBkColor(reinterpret_cast<HDC>(wParam), state->theme.popup);
+                return reinterpret_cast<LRESULT>(
+                    FluentComboListBrush(reinterpret_cast<HWND>(lParam), state->theme));
+            }
+            break;
+        case WM_COMMAND: {
+            if (!state) break;
+            if (g_unloading) return 0;
+            if (HWND control = reinterpret_cast<HWND>(lParam); IsFluentCombo(control)) {
+                HandleFluentComboCommand(control, HIWORD(wParam), state->theme);
+            }
+            WORD id = LOWORD(wParam);
+            if (id == kLoginKeyId && HIWORD(wParam) == EN_SETFOCUS) {
+                InvalidateRect(hWnd, &state->keyFrame, FALSE);
+                return 0;
+            }
+            if (id == kLoginKeyId && HIWORD(wParam) == EN_KILLFOCUS) {
+                InvalidateRect(hWnd, &state->keyFrame, FALSE);
+                return 0;
+            }
+            if (id == kLoginProviderId && HIWORD(wParam) == CBN_SELCHANGE) {
+                ShowLoginKeyRow(hWnd, *state, LoginSelectedProvider(*state) == L"narit");
+                return 0;
+            }
+            if (id == IDOK) {
+                std::wstring provider = LoginSelectedProvider(*state);
+                std::wstring key = provider == L"narit" ? LoginEditText(state->keyEdit) : L"";
+                if (provider == L"narit") {
+                    SetWindowTextW(state->status, Tr(Str::LoginWaiting));
+                    UpdateWindow(hWnd);
+                }
+                std::wstring message;
+                AddAccountResult result = AddAccountAndSignIn(provider, key, &message);
+                WipeBuffer(key);
+                if (result == AddAccountResult::Added) {
+                    state->accepted = true;
+                    DestroyOwnedModal(hWnd);
+                    return 0;
+                }
+                SetWindowTextW(state->status, result == AddAccountResult::MissingKey
+                                                  ? Tr(Str::LoginKeyRequired)
+                                                  : message.c_str());
+                if (provider == L"narit") SetFocus(state->keyEdit);
+                return 0;
+            }
+            if (id == IDCANCEL) {
+                DestroyOwnedModal(hWnd);
+                return 0;
+            }
+            break;
+        }
+        case WM_DPICHANGED:
+            if (state) {
+                state->dpi = HIWORD(wParam);
+                auto* suggested = reinterpret_cast<RECT*>(lParam);
+                SetWindowPos(hWnd, nullptr, suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                RecreateAccountLoginVisuals(hWnd, *state);
+                LayoutAccountLogin(hWnd, *state);
+            }
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_DWMCOLORIZATIONCOLORCHANGED:
+            if (state && !state->updatingVisuals) {
+                RecreateAccountLoginVisuals(hWnd, *state);
+                LayoutAccountLogin(hWnd, *state);
+            }
+            return 0;
+        case WM_ACTIVATE:
+            if (state) InvalidateRect(hWnd, nullptr, FALSE);
+            break;
+        case WM_ERASEBKGND:
+            if (state) return 1;
+            break;
+        case WM_CLOSE:
+            DestroyOwnedModal(hWnd);
+            return 0;
+        case WM_DESTROY:
+            if (state) state->done = true;
+            return 0;
+        case WM_NCDESTROY:
+            if (state) ReleaseNativeTheme(state->theme);
+            break;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+static constexpr PCWSTR kAccountLoginClass = L"AiUsageAddAccount_" WH_MOD_ID;
+
+// Runs on the taskbar's UI thread, like the mod's other dialogs.
+static void OpenAccountLoginWindow() {
+    if (g_unloading) return;
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = AccountLoginWndProc;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.lpszClassName = kAccountLoginClass;
+    windowClass.hbrBackground = nullptr;
+    if (!RegisterClassExW(&windowClass)) {
+        if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS ||
+            !UnregisterClassW(kAccountLoginClass, instance) ||
+            !RegisterClassExW(&windowClass)) {
+            return;
+        }
+    }
+
+    AccountLoginState state;
+    state.providers = {L"narit", L"anthropic", L"openai", L"antigravity"};
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    if (!GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &monitorInfo)) {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &monitorInfo.rcWork, 0);
+    }
+    UINT dpi = WindowDpi(nullptr);
+    // Same frame as the account editor: WS_THICKFRAME gives the DWM border, shadow and corners.
+    constexpr DWORD style = WS_POPUP | WS_THICKFRAME | WS_SYSMENU;
+    RECT frame{0, 0, ScaleForDpi(kLoginClientWidth, dpi), ScaleForDpi(kLoginClientHeight, dpi)};
+    using AdjustWindowRectExForDpi_t = BOOL(WINAPI*)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    auto adjust = reinterpret_cast<AdjustWindowRectExForDpi_t>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi"));
+    if (!adjust || !adjust(&frame, style, FALSE, 0, dpi)) {
+        AdjustWindowRectEx(&frame, style, FALSE, 0);
+    }
+    int width = frame.right - frame.left;
+    int height = frame.bottom - frame.top;
+    int x = monitorInfo.rcWork.left +
+            (monitorInfo.rcWork.right - monitorInfo.rcWork.left - width) / 2;
+    int y = monitorInfo.rcWork.top +
+            (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top - height) / 2;
+    HWND window = CreateWindowExW(0, kAccountLoginClass, Tr(Str::LoginAddAccount), style, x, y,
+                                  width, height, nullptr, nullptr, instance, &state);
+    if (!window) {
+        UnregisterClassW(kAccountLoginClass, instance);
+        return;
+    }
+    // The window belongs to explorer.exe, and the shell lists none of that process's windows: on its
+    // own it is a window Alt+Tab and the taskbar cannot reach. An app window with the mod's AUMID gets
+    // its own button, the same way the settings window does.
+    SetWindowLongPtrW(window, GWL_EXSTYLE,
+                      (GetWindowLongPtrW(window, GWL_EXSTYLE) | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW);
+    SetSettingsWindowAppId(window, true);
+    ShowNativeWindowComposed(window);
+    SettingsModalWindowScope modalScope(window);
+    SetForegroundWindow(window);
+    SetFocus(GetDlgItem(window, kLoginKeyId));
+
+    MSG message;
+    while (!g_unloading && !state.done) {
+        int result = GetMessageW(&message, nullptr, 0, 0);
+        if (result == 0) {
+            PostQuitMessage((int)message.wParam);
+            break;
+        }
+        if (result < 0) break;
+        if (!IsDialogMessageW(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    if (IsWindow(window)) {
+        // The AUMID has to come off before the window dies.
+        SetSettingsWindowAppId(window, false);
+        DestroyWindow(window);
+    }
+    UnregisterClassW(kAccountLoginClass, instance);
+}
+
+// Takes an account off the taskbar and forgets its stored sign-in, after one confirmation.
+static bool RemoveAccountByIdentity(uint64_t identityHash) {
+    if (g_unloading) return false;
+    AccountConfig account;
+    {
+        std::lock_guard<std::mutex> lk(g_settingsMutex);
+        auto it = std::find_if(g_settings.accounts.begin(), g_settings.accounts.end(),
+            [&](const AccountConfig& candidate) {
+                return AccountIdentityHash(candidate) == identityHash;
+            });
+        if (it == g_settings.accounts.end()) return false;
+        account = *it;
+    }
+    if (MessageBoxW(nullptr, Tr(Str::SettingsRemoveAccountBody), Tr(Str::SettingsRemoveThisAccount),
+                    MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION | MB_TOPMOST) != IDYES) {
+        return false;
+    }
+    if (g_unloading) return false;
+    std::unique_lock<std::mutex> configLock(g_configEditMutex);
+    Settings settings;
+    {
+        std::lock_guard<std::mutex> lk(g_settingsMutex);
+        settings = g_settings;
+    }
+    std::string revocation =
+        account.provider == L"antigravity" ? GoogleRevocationToken(identityHash) : std::string();
+    ClearStoredTokenAndBumpAuthEpoch(identityHash);
+    QueueGoogleRevocation(std::move(revocation));
+    // A provider the user removed on purpose is not offered again by the CLI detection.
+    if (std::find(settings.detectedProviders.begin(), settings.detectedProviders.end(),
+                  account.provider) == settings.detectedProviders.end()) {
+        settings.detectedProviders.push_back(account.provider);
+    }
+    settings.accounts.erase(
+        std::remove_if(settings.accounts.begin(), settings.accounts.end(),
+                       [&](const AccountConfig& candidate) {
+                           return AccountIdentityHash(candidate) == identityHash;
+                       }),
+        settings.accounts.end());
+    SettingsApplyResult applyResult = ApplyOwnedSettings(std::move(settings), 0, 0);
+    configLock.unlock();
+    if (applyResult == SettingsApplyResult::Changed) FinishSettingsApply();
+    return applyResult != SettingsApplyResult::Failed;
 }
 
 static void AddAccountFromSettingsWindow(SettingsWindowState& state) {
